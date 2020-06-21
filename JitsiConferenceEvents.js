@@ -149,6 +149,28 @@ export const LOCK_STATE_CHANGED = 'conference.lock_state_changed';
 export const SERVER_REGION_CHANGED = 'conference.server_region_changed';
 
 /**
+ * An event(library-private) fired when a new media session is added to the conference.
+ * @type {string}
+ * @private
+ */
+export const _MEDIA_SESSION_STARTED = 'conference.media_session.started';
+
+/**
+ * An event(library-private) fired when the conference switches the currently active media session.
+ * @type {string}
+ * @private
+ */
+export const _MEDIA_SESSION_ACTIVE_CHANGED = 'conference.media_session.active_changed';
+
+/**
+ * Indicates that the conference had changed to members only enabled/disabled.
+ * The first argument of this event is a <tt>boolean</tt> which when set to
+ * <tt>true</tt> means that the conference is running in members only mode.
+ * You may need to use Lobby if supported to ask for permissions to enter the conference.
+ */
+export const MEMBERS_ONLY_CHANGED = 'conference.membersOnlyChanged';
+
+/**
  * New text message was received.
  */
 export const MESSAGE_RECEIVED = 'conference.messageReceived';
@@ -328,3 +350,18 @@ export const USER_STATUS_CHANGED = 'conference.statusChanged';
  * Event indicates that the bot participant type changed.
  */
 export const BOT_TYPE_CHANGED = 'conference.bot_type_changed';
+
+/**
+ * A new user joined the lobby room.
+ */
+export const LOBBY_USER_JOINED = 'conference.lobby.userJoined';
+
+/**
+ * A user from the lobby room has been update.
+ */
+export const LOBBY_USER_UPDATED = 'conference.lobby.userUpdated';
+
+/**
+ * A user left the lobby room.
+ */
+export const LOBBY_USER_LEFT = 'conference.lobby.userLeft';

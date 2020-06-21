@@ -61,6 +61,7 @@ import {
     createJingleEvent,
     createP2PEvent
 } from './service/statistics/AnalyticsEvents';
+import { QualityController } from './modules/qualitycontrol/QualityController';
 import * as XMPPEvents from './service/xmpp/XMPPEvents';
 
 const logger = getLogger(__filename);
@@ -237,12 +238,6 @@ export default function JitsiConference(options) {
     this.recordingManager = new RecordingManager(this.room);
     this._conferenceJoinAnalyticsEventSent = false;
 
-    /**
-     * Max frame height that the user prefers to send to the remote participants.
-     * @type {number}
-     */
-    this.maxFrameHeight = null;
-
     if (browser.supportsInsertableStreams()) {
         this._e2eeCtx = new E2EEContext({ salt: this.options.name });
     }
@@ -356,6 +351,8 @@ JitsiConference.prototype._init = function(options = {}) {
         this.eventManager.setupRTCListeners();
     }
 
+    this.qualityController = new QualityController(this);
+
     this.participantConnectionStatus
         = new ParticipantConnectionStatusHandler(
             this.rtc,
@@ -374,8 +371,8 @@ JitsiConference.prototype._init = function(options = {}) {
         this.statistics = new Statistics(this.xmpp, {
             aliasName: this._statsCurrentId,
             userName: config.statisticsDisplayName ? config.statisticsDisplayName : this.myUserId(),
-            callStatsConfIDNamespace: this.connection.options.hosts.domain,
             confID: config.confID || `${this.connection.options.hosts.domain}/${this.options.name}`,
+            siteID: config.siteID,
             customScriptUrl: config.callStatsCustomScriptUrl,
             callStatsID: config.callStatsID,
             callStatsSecret: config.callStatsSecret,
@@ -395,7 +392,9 @@ JitsiConference.prototype._init = function(options = {}) {
     // listeners are removed from statistics module.
     this.eventManager.setupStatisticsListeners();
 
-    if (config.enableTalkWhileMuted) {
+    // Disable VAD processing on Safari since it causes audio input to
+    // fail on some of the mobile devices.
+    if (config.enableTalkWhileMuted && !browser.isSafari()) {
 
         // If VAD processor factory method is provided uses VAD based detection, otherwise fallback to audio level
         // based detection.
@@ -617,6 +616,31 @@ JitsiConference.prototype.leave = function() {
     // If this.room == null we are calling second time leave().
     return Promise.reject(
         new Error('The conference is has been already left'));
+};
+
+/**
+ * Returns the currently active media session if any.
+ *
+ * @returns {JingleSessionPC|undefined}
+ * @private
+ */
+JitsiConference.prototype._getActiveMediaSession = function() {
+    return this.isP2PActive() ? this.p2pJingleSession : this.jvbJingleSession;
+};
+
+/**
+ * Returns an array containing all media sessions existing in this conference.
+ *
+ * @returns {Array<JingleSessionPC>}
+ * @private
+ */
+JitsiConference.prototype._getMediaSessions = function() {
+    const sessions = [];
+
+    this.jvbJingleSession && sessions.push(this.jvbJingleSession);
+    this.p2pJingleSession && sessions.push(this.p2pJingleSession);
+
+    return sessions;
 };
 
 /**
@@ -1725,14 +1749,6 @@ JitsiConference.prototype.onCallAccepted = function(session, answer) {
     if (this.p2pJingleSession === session) {
         logger.info('P2P setAnswer');
 
-        // Apply pending video constraints.
-        if (this.pendingVideoConstraintsOnP2P) {
-            this.p2pJingleSession.setSenderVideoConstraint(this.maxFrameHeight)
-                .catch(err => {
-                    logger.error(`Sender video constraints failed on p2p session - ${err}`);
-                });
-        }
-
         // Setup E2EE.
         const localTracks = this.getLocalTracks();
 
@@ -1741,6 +1757,7 @@ JitsiConference.prototype.onCallAccepted = function(session, answer) {
         }
 
         this.p2pJingleSession.setAnswer(answer);
+        this.eventEmitter.emit(JitsiConferenceEvents._MEDIA_SESSION_STARTED, this.p2pJingleSession);
     }
 };
 
@@ -1915,13 +1932,15 @@ JitsiConference.prototype._acceptJvbIncomingCall = function(
                 // to be turned off here.
                 if (this.isP2PActive() && this.jvbJingleSession) {
                     this._suspendMediaTransferForJvbConnection();
-                } else if (this.jvbJingleSession && this.maxFrameHeight) {
-                    // Apply user preferred max frame height if it was called before this
-                    // jingle session was created.
-                    this.jvbJingleSession.setSenderVideoConstraint(this.maxFrameHeight)
-                        .catch(err => {
-                            logger.error(`Sender video constraints failed on jvb session - ${err}`);
-                        });
+                }
+
+                this.eventEmitter.emit(
+                    JitsiConferenceEvents._MEDIA_SESSION_STARTED,
+                    jingleSession);
+                if (!this.isP2PActive()) {
+                    this.eventEmitter.emit(
+                        JitsiConferenceEvents._MEDIA_SESSION_ACTIVE_CHANGED,
+                        jingleSession);
                 }
 
                 // Setup E2EE.
@@ -2695,14 +2714,9 @@ JitsiConference.prototype._acceptP2PIncomingCall = function(
         () => {
             logger.debug('Got RESULT for P2P "session-accept"');
 
-            // Apply user preferred max frame height if it was called before this
-            // jingle session was created.
-            if (this.pendingVideoConstraintsOnP2P) {
-                this.p2pJingleSession.setSenderVideoConstraint(this.maxFrameHeight)
-                    .catch(err => {
-                        logger.error(`Sender video constraints failed on p2p session - ${err}`);
-                    });
-            }
+            this.eventEmitter.emit(
+                JitsiConferenceEvents._MEDIA_SESSION_STARTED,
+                this.p2pJingleSession);
 
             // Setup E2EE.
             for (const track of localTracks) {
@@ -3005,6 +3019,9 @@ JitsiConference.prototype._setP2PStatus = function(newStatus) {
         JitsiConferenceEvents.P2P_STATUS,
         this,
         this.p2p);
+    this.eventEmitter.emit(
+        JitsiConferenceEvents._MEDIA_SESSION_ACTIVE_CHANGED,
+        this._getActiveMediaSession());
 
     // Refresh connection interrupted/restored
     this.eventEmitter.emit(
@@ -3312,13 +3329,12 @@ JitsiConference.prototype.getSpeakerStats = function() {
  * Sets the maximum video size the local participant should receive from remote
  * participants.
  *
- * @param {number} maxFrameHeightPixels the maximum frame height, in pixels,
+ * @param {number} maxFrameHeight - the maximum frame height, in pixels,
  * this receiver is willing to receive.
  * @returns {void}
  */
-JitsiConference.prototype.setReceiverVideoConstraint = function(
-        maxFrameHeight) {
-    this.rtc.setReceiverVideoConstraint(maxFrameHeight);
+JitsiConference.prototype.setReceiverVideoConstraint = function(maxFrameHeight) {
+    this.qualityController.setPreferredReceiveMaxFrameHeight(maxFrameHeight);
 };
 
 /**
@@ -3329,22 +3345,7 @@ JitsiConference.prototype.setReceiverVideoConstraint = function(
  * successful and rejected otherwise.
  */
 JitsiConference.prototype.setSenderVideoConstraint = function(maxFrameHeight) {
-    this.maxFrameHeight = maxFrameHeight;
-    this.pendingVideoConstraintsOnP2P = true;
-    const promises = [];
-
-    // We have to always set the sender video constraints on the jvb connection
-    // when we switch from p2p to jvb connection since we need to check if the
-    // tracks constraints have been modified when in p2p.
-    if (this.jvbJingleSession) {
-        promises.push(this.jvbJingleSession.setSenderVideoConstraint(maxFrameHeight));
-    }
-    if (this.p2pJingleSession) {
-        this.pendingVideoConstraintsOnP2P = false;
-        promises.push(this.p2pJingleSession.setSenderVideoConstraint(maxFrameHeight));
-    }
-
-    return Promise.all(promises);
+    return this.qualityController.setPreferredSendMaxFrameHeight(maxFrameHeight);
 };
 
 /**
@@ -3413,6 +3414,85 @@ JitsiConference.prototype.setE2EEKey = function(key) {
     }
 
     this._e2eeCtx.setKey(key);
+};
+
+/**
+ * Returns <tt>true</tt> if lobby support is enabled in the backend.
+ *
+ * @returns {boolean} whether lobby is supported in the backend.
+ */
+JitsiConference.prototype.isLobbySupported = function() {
+    return Boolean(this.room && this.room.getLobby().isSupported());
+};
+
+/**
+ * Returns <tt>true</tt> if the room has members only enabled.
+ *
+ * @returns {boolean} whether conference room is members only.
+ */
+JitsiConference.prototype.isMembersOnly = function() {
+    return Boolean(this.room && this.room.membersOnlyEnabled);
+};
+
+/**
+ * Enables lobby by moderators
+ *
+ * @returns {Promise} resolves when lobby room is joined or rejects with the error.
+ */
+JitsiConference.prototype.enableLobby = function() {
+    if (this.room && this.isModerator()) {
+        return this.room.getLobby().enable();
+    }
+
+    return Promise.reject(
+        new Error('The conference not started or user is not moderator'));
+};
+
+/**
+ * Disabled lobby by moderators
+ *
+ * @returns {void}
+ */
+JitsiConference.prototype.disableLobby = function() {
+    if (this.room && this.isModerator()) {
+        this.room.getLobby().disable();
+    }
+};
+
+/**
+ * Joins the lobby room with display name and optional email or with a shared password to skip waiting.
+ *
+ * @param {string} displayName Display name should be set to show it to moderators.
+ * @param {string} email Optional email is used to present avatar to the moderator.
+ * @returns {Promise<never>}
+ */
+JitsiConference.prototype.joinLobby = function(displayName, email) {
+    if (this.room) {
+        return this.room.getLobby().join(displayName, email);
+    }
+
+    return Promise.reject(new Error('The conference not started'));
+};
+
+/**
+ * Denies an occupant in the lobby room access to the conference.
+ * @param {string} id The participant id.
+ */
+JitsiConference.prototype.lobbyDenyAccess = function(id) {
+    if (this.room) {
+        this.room.getLobby().denyAccess(id);
+    }
+};
+
+/**
+ * Approves the request to join the conference to a participant waiting in the lobby.
+ *
+ * @param {string} id The participant id.
+ */
+JitsiConference.prototype.lobbyApproveAccess = function(id) {
+    if (this.room) {
+        this.room.getLobby().approveAccess(id);
+    }
 };
 
 /**
